@@ -62,15 +62,20 @@ def _initialize_vocab(special_tokens: list[str] | None) -> Tuple[List[bytes], Di
 
 def _best_pair(pair_counts: Counter, id_to_bytes: List[bytes]) -> Tuple[int, int] | None:
     """从频次表里挑“最高频合并对”；并列时按字节序稳定排序。"""
+    best_pair = None
+    max_score = (-1, b"", b"")
 
-    if not pair_counts:
-        return None
+    for pair, count in pair_counts.items():
+        if count <= 0:
+            continue
 
-    def key_fn(item):
-        (a, b), cnt = item
-        return (cnt, id_to_bytes[a], id_to_bytes[b])  # 先比频次，再按字节内容打平
+        # Tie-breaking logic: (count, first_token_bytes, second_token_bytes)
+        score = (count, id_to_bytes[pair[0]], id_to_bytes[pair[1]])
+        if score > max_score:
+            max_score = score
+            best_pair = pair
 
-    return max(pair_counts.items(), key=key_fn)[0]
+    return best_pair
 
 
 def train_bpe(
@@ -81,31 +86,6 @@ def train_bpe(
     """训练 byte-level BPE，返回词表 (id->bytes) 和合并序列。"""
 
     path_obj = Path(input_path)
-
-    # 小语料 + 500 词时直接读参考结果，跳过训练（用于测速/单测）。
-    if path_obj.name == "corpus.en" and vocab_size == 500:
-        fixtures_dir = path_obj.parent
-        ref_vocab_path = fixtures_dir / "train-bpe-reference-vocab.json"
-        ref_merges_path = fixtures_dir / "train-bpe-reference-merges.txt"
-        gpt2_byte_decoder = {v: k for k, v in gpt2_bytes_to_unicode().items()}
-
-        ref_vocab_json = json.loads(ref_vocab_path.read_text(encoding="utf-8"))
-        vocab = {
-            int(idx): bytes([gpt2_byte_decoder[token] for token in token_str])
-            for token_str, idx in ref_vocab_json.items()
-        }
-        ref_merges_txt = [
-            tuple(line.rstrip().split(" ")) for line in ref_merges_path.read_text(encoding="utf-8").splitlines() if line
-        ]
-        merges = [
-            (
-                bytes([gpt2_byte_decoder[t] for t in merge_token_1]),
-                bytes([gpt2_byte_decoder[t] for t in merge_token_2]),
-            )
-            for merge_token_1, merge_token_2 in ref_merges_txt
-        ]
-        return vocab, merges
-
     text = path_obj.read_text(encoding="utf-8")  # 读取训练语料
 
     # 统计预分词（byte 序列）频次
@@ -116,21 +96,20 @@ def train_bpe(
     id_to_bytes, _ = _initialize_vocab(special_tokens)  # 初始化词表（包含特殊 token）
 
     # 用可变列表存序列，便于原地合并
-    seqs: List[Tuple[List[int], int]] = [[list(seq), freq] for seq, freq in token_counter.items()]
+    seqs: List[List] = [[list(seq), freq] for seq, freq in token_counter.items()]
 
     merges: list[tuple[bytes, bytes]] = []
 
+    # 初始统计所有相邻 pair 的频次
+    pair_counts: Counter[tuple[int, int]] = Counter()
+    for seq, freq in seqs:
+        for i in range(len(seq) - 1):
+            pair_counts[(seq[i], seq[i + 1])] += freq
+
     # 迭代合并，直到词表到达目标大小或无可合并对
     while len(id_to_bytes) < vocab_size:
-        pair_counts: Counter[tuple[int, int]] = Counter()  # 统计相邻 pair 的频次
-        for seq, freq in seqs:
-            if len(seq) < 2:
-                continue
-            for pair in zip(seq, seq[1:]):
-                pair_counts[pair] += freq
-
         best = _best_pair(pair_counts, id_to_bytes)
-        if best is None or pair_counts[best] == 0:  # 无可合并或频次为 0
+        if best is None:
             break
 
         a, b = best
@@ -139,20 +118,44 @@ def train_bpe(
         id_to_bytes.append(new_bytes)
         merges.append((id_to_bytes[a], id_to_bytes[b]))  # 记录合并顺序
 
-        # 原地把所有 a b 出现替换为 new_id
-        for seq, _freq in seqs:
+        # 增量更新 pair 频次
+        for s_info in seqs:
+            seq, freq = s_info
             if len(seq) < 2:
                 continue
+
             i = 0
-            out: List[int] = []
+            new_seq = []
+            changed = False
             while i < len(seq):
                 if i < len(seq) - 1 and seq[i] == a and seq[i + 1] == b:
-                    out.append(new_id)
+                    # 左右相邻对受影响，先减去旧频次
+                    pair_counts[(a, b)] -= freq
+                    if i > 0:
+                        pair_counts[(new_seq[-1], a)] -= freq
+                    if i < len(seq) - 2:
+                        pair_counts[(b, seq[i + 2])] -= freq
+
+                    # 合并为新 ID
+                    new_seq.append(new_id)
+
+                    # 加上新形成的 pair 频次
+                    if len(new_seq) > 1:
+                        pair_counts[(new_seq[-2], new_id)] += freq
+                    if i < len(seq) - 2:
+                        pair_counts[(new_id, seq[i + 2])] += freq
+
                     i += 2
+                    changed = True
                 else:
-                    out.append(seq[i])
+                    new_seq.append(seq[i])
                     i += 1
-            seq[:] = out
+            if changed:
+                s_info[0] = new_seq
+
+        # 定期清理 pair_counts 中的 0 项，以加速 _best_pair 遍历
+        if len(id_to_bytes) % 100 == 0:
+            pair_counts = Counter({k: v for k, v in pair_counts.items() if v > 0})
 
     vocab = {i: b for i, b in enumerate(id_to_bytes)}  # 构建最终 id->bytes 词表
     return vocab, merges
